@@ -5,6 +5,8 @@ from pathlib import Path
 
 from platformdirs import user_cache_dir
 
+from .sites import SiteRequest
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 Chrome/115.0.0.0 Safari/537.36"
@@ -174,6 +176,9 @@ PROFILE_CLASS_HINTS = ["profile", "user", "account"]
 ERROR_CLASS_HINTS = ["error", "not-found", "missing", "unavailable"]
 
 
+DEFAULT_CATALOG = "extended"
+
+
 def default_fingerprints_path() -> Path:
     return Path(user_cache_dir("aliens_eye")) / "fingerprints.json"
 
@@ -191,6 +196,10 @@ class ScannerConfig:
     fingerprints_path: Path = field(default_factory=default_fingerprints_path)
     output_dir: Path = Path("results")
     use_playwright: bool = False
+    # For every Found, also ask the site for a username that cannot exist, and
+    # downgrade to Maybe when both answers are the same page. One extra request
+    # per site that reports Found.
+    control_check: bool = True
     max_fingerprints_per_label: int = 50
     proxy: str | None = None
     include_sites: list[str] | None = None
@@ -202,3 +211,10 @@ class ScannerConfig:
     plain_output: bool = False
     only_found: bool = False
     json_stdout: bool = False
+    explain: bool = False
+    # Scans use the full verified catalog unless told otherwise; "standard"
+    # is the smaller original list (also what evaluation and training read).
+    catalog: str = DEFAULT_CATALOG
+    include_tags: list[str] | None = None
+    include_sources: list[str] | None = None
+    request: SiteRequest | None = None

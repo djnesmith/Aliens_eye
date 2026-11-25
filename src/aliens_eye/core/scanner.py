@@ -9,16 +9,19 @@ from urllib.parse import quote
 
 import aiohttp
 
-from aliens_eye.utils.console import ScanView, get_console
+from aliens_eye.utils.console import ScanView, get_console, render_explanations
 
 from .analyzer import FeatureExtractor
 from .browser import BrowserFallback
 from .config import DEFAULT_HEADERS, MAX_HEADER_SIZE, ScannerConfig
+from .control import PageShape, control_username, http_overrule, http_unavailable, page_shape, same_page
 from .detector import Detector
+from .explain import build_explanation, detector_evidence
 from .fingerprints import FingerprintStore, build_fingerprint
-from .http import fetch_url
+from .http import KEEPALIVE_SECONDS, describe_error, fetch_url
 from .rate_limit import DomainRateLimiter
-from .variations import generate_username_variations
+from .sites import SiteCatalog, catalog_from_dict, read_json
+from .variations import generate_username_variations, scan_cost
 
 
 @dataclass
@@ -33,13 +36,27 @@ class ScanResult:
     ai_analysis: dict[str, Any]
 
 
-def load_sites_data(path: Path | None = None) -> dict[str, str]:
+def load_sites_data(path: Path | None = None, *, catalog: str = "standard") -> dict[str, str]:
     """Load site definitions from a custom path or the packaged sites.json."""
     if path is not None:
-        with Path(path).open("r", encoding="utf-8") as handle:
-            return json.load(handle)
-    text = (resources.files("aliens_eye.data") / "sites.json").read_text("utf-8")
-    return json.loads(text)
+        data = read_json(Path(path))
+    else:
+        if catalog not in {"standard", "extended"}:
+            raise ValueError("catalog must be 'standard' or 'extended'")
+        resource = "extended_sites.json" if catalog == "extended" else "sites.json"
+        text = (resources.files("aliens_eye.data") / resource).read_text("utf-8")
+        data = json.loads(text)
+    if isinstance(data, dict) and "schema_version" in data:
+        result = catalog_from_dict(data)
+        if path is None and catalog == "extended":
+            from aliens_eye.catalog import merge_catalogs
+
+            community = json.loads((resources.files("aliens_eye.data") / "community_sites.json").read_text("utf-8"))
+            result = merge_catalogs(result, catalog_from_dict(community))
+        return result
+    if not isinstance(data, dict) or any(not isinstance(v, str) for v in data.values()):
+        raise ValueError("Sites must be a URL map or a versioned site catalog")
+    return data
 
 
 def load_site_plugins(extra_dirs: list[Path] | None = None) -> dict[str, str]:
@@ -59,12 +76,42 @@ def load_site_plugins(extra_dirs: list[Path] | None = None) -> dict[str, str]:
             continue
         for path in sorted(directory.glob("*.json")):
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                data = load_sites_data(path)
+            except (OSError, ValueError):
                 continue
             if isinstance(data, dict):
-                merged.update({str(k): str(v) for k, v in data.items()})
+                merged = merge_site_maps(merged, data)
     return merged
+
+
+def merge_site_maps(base: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
+    from .sites import CatalogError, SiteDefinition
+
+    if not isinstance(base, SiteCatalog) and not isinstance(extra, SiteCatalog):
+        return {**base, **extra}
+    definitions = dict(base.definitions) if isinstance(base, SiteCatalog) else {}
+    sources = dict(base.sources) if isinstance(base, SiteCatalog) else {}
+    issues = list(getattr(base, "issues", [])) + list(getattr(extra, "issues", []))
+    for name, url in base.items():
+        if name not in definitions:
+            try:
+                definitions[name] = SiteDefinition.from_dict(name, {"url": url})
+            except CatalogError as exc:
+                issues.append({"source": "legacy", "site": name, "reason": str(exc)})
+                continue
+    extra_items = ((name, site.url) for name, site in extra.definitions.items()) if isinstance(extra, SiteCatalog) else extra.items()
+    for name, url in extra_items:
+        if isinstance(extra, SiteCatalog):
+            definitions[name] = extra.definitions[name]
+        else:
+            definitions[name] = SiteDefinition.from_dict(name, {"url": url})
+    if isinstance(extra, SiteCatalog):
+        sources.update(extra.sources)
+    return SiteCatalog(
+        definitions, sources,
+        issues,
+        getattr(base, "deduplicated", 0) + getattr(extra, "deduplicated", 0),
+    )
 
 
 def load_nsfw_sites() -> list[str]:
@@ -80,23 +127,45 @@ def filter_sites(
     sites: dict[str, str],
     include: list[str] | None = None,
     exclude: list[str] | None = None,
+    *,
+    tags: list[str] | None = None,
+    sources: list[str] | None = None,
+    exclude_nsfw: bool = False,
 ) -> dict[str, str]:
     """Filter sites by case-insensitive substring match on the site name."""
     result = sites
+    def names_for(name):
+        definition = getattr(sites, "definitions", {}).get(name)
+        return (name, *definition.aliases) if definition else (name,)
+
     if include:
         terms = [t.lower() for t in include if t]
         result = {
             name: tmpl
             for name, tmpl in result.items()
-            if any(term in name.lower() for term in terms)
+            if any(term in alias.lower() for term in terms for alias in names_for(name))
         }
     if exclude:
         terms = [t.lower() for t in exclude if t]
         result = {
             name: tmpl
             for name, tmpl in result.items()
-            if not any(term in name.lower() for term in terms)
+            if not any(term in alias.lower() for term in terms for alias in names_for(name))
         }
+    if isinstance(sites, SiteCatalog):
+        wanted_tags = {t.casefold() for t in tags or []}
+        wanted_sources = {s.casefold() for s in sources or []}
+        result = {
+            name: url for name, url in result.items()
+            if (not exclude_nsfw or not sites.definitions[name].nsfw)
+            and (not wanted_tags or wanted_tags.intersection(t.casefold() for t in sites.definitions[name].tags))
+            and (not wanted_sources or wanted_sources.intersection(
+                (sites.definitions[name].source, *sites.definitions[name].also_in)
+            ))
+        }
+        return sites.subset(result)
+    if tags or sources:
+        return {}
     return result
 
 
@@ -120,19 +189,69 @@ def format_site_url(site_name: str, url_template: str, username: str) -> str:
     return url
 
 
-def build_connector(config: ScannerConfig, limit: int) -> aiohttp.BaseConnector:
-    """TCP connector, or a SOCKS proxy connector when a socks:// proxy is set."""
+# Phrases that show up in the title or meta tags of anti-bot, verification and
+# error pages: Cloudflare interstitials, CAPTCHAs, access-denied and outage
+# pages. A match means the response is that kind of page, not a user profile.
+_BOT_WALL_KEYWORDS = (
+    "just a moment",
+    "checking your browser",
+    "client challenge",
+    "captcha",
+    "verify you are human",
+    "verify your browser",
+    "security verification",
+    "access denied",
+    "attention required",
+    "please wait",
+    "too many requests",
+    "ddos",
+    "general error",
+    "internal server error",
+    "temporarily unavailable",
+    "has been retired",
+    "are you human",
+    "the request could not be",
+    "invalid user",
+)
+
+
+def _looks_like_bot_wall(signals: dict[str, Any]) -> bool:
+    """Whether a response is an anti-bot, verification or error page, not a profile."""
+    title = str(signals.get("title", "") or "").lower()
+    meta = " ".join(str(m) for m in (signals.get("meta_samples") or [])).lower()
+    haystack = f"{title} {meta}"
+    return any(keyword in haystack for keyword in _BOT_WALL_KEYWORDS)
+
+
+def build_connector(
+    config: ScannerConfig, limit: int, resolver=None
+) -> aiohttp.BaseConnector:
+    """TCP connector, or a SOCKS proxy connector when a socks:// proxy is set.
+
+    ``resolver`` is for fetches of URLs taken from scanned pages; see
+    ``core.netguard.PublicOnlyResolver``. It has no effect through a SOCKS
+    proxy, where the proxy does the resolving.
+
+    ``keepalive_timeout`` is kept short on purpose; see ``KEEPALIVE_SECONDS``.
+    """
     if config.proxy and config.proxy.lower().startswith(("socks4://", "socks5://")):
         from aiohttp_socks import ProxyConnector
 
-        return ProxyConnector.from_url(config.proxy, limit=limit)
-    return aiohttp.TCPConnector(limit=limit)
+        return ProxyConnector.from_url(
+            config.proxy, limit=limit, keepalive_timeout=KEEPALIVE_SECONDS
+        )
+    if resolver is not None:
+        return aiohttp.TCPConnector(
+            limit=limit, resolver=resolver, keepalive_timeout=KEEPALIVE_SECONDS
+        )
+    return aiohttp.TCPConnector(limit=limit, keepalive_timeout=KEEPALIVE_SECONDS)
 
 
 def build_session(
     config: ScannerConfig,
     limit: int,
     headers: dict[str, str] | None = None,
+    resolver=None,
 ) -> aiohttp.ClientSession:
     """Session for fetching site pages, with the header-size limit raised.
 
@@ -143,10 +262,26 @@ def build_session(
     """
     return aiohttp.ClientSession(
         headers=DEFAULT_HEADERS if headers is None else headers,
-        connector=build_connector(config, limit),
+        connector=build_connector(config, limit, resolver),
         max_line_size=MAX_HEADER_SIZE,
         max_field_size=MAX_HEADER_SIZE,
     )
+
+
+async def overrule_found(status_code: int, signals: dict[str, Any], same_as_missing_user=None):
+    """Whether a page scored Found should be reported as something else.
+
+    Returns ``(status, reason)`` or None. The checks run cheapest first, and
+    ``same_as_missing_user`` (an async callable, or None to skip it) is only
+    awaited when nothing else has settled the matter, since it costs a request.
+    Shared by the scanner and the self-check so that both report the same thing.
+    """
+    overruled = http_overrule(status_code)
+    if overruled is None and _looks_like_bot_wall(signals):
+        overruled = ("Maybe", "botwall-capped")
+    if overruled is None and same_as_missing_user is not None and await same_as_missing_user():
+        overruled = ("Maybe", "same-as-missing-user")
+    return overruled
 
 
 class UsernameScanner:
@@ -186,8 +321,23 @@ class UsernameScanner:
         # without touching the process-wide console.
         self.console = console or get_console()
 
+        # What each site shows for a username that does not exist, fetched the
+        # first time that site reports Found. None: it could not be fetched.
+        self._controls: dict[str, PageShape | None] = {}
+        self._defined_controls: dict[str, tuple] = {}
+
+        # One warning per scan for a browser fallback that will not start.
+        # Hundreds of Maybes each fail the same way, and at debug level the
+        # whole scan looked healthy while none of them were re-checked (#26).
+        self._fallback_warned = False
+
         self.results_dir = config.output_dir
         self.results_dir.mkdir(parents=True, exist_ok=True)
+
+    def reset_cycle(self) -> None:
+        self._controls.clear()
+        self._defined_controls.clear()
+        self._fallback_warned = False
 
     async def scan_with_variations(
         self, base_username: str, level: str
@@ -203,6 +353,8 @@ class UsernameScanner:
             preview = ", ".join(variations[:5])
             more = f" and {len(variations) - 5} more..." if len(variations) > 5 else ""
             self.console.print(f"[dim]Variations: {preview}{more}[/dim]")
+            cost = scan_cost(len(variations), len(self.sites_data))
+            self.console.print(f"[dim]This will make {cost.describe()}.[/dim]")
 
         if not base_username.isascii():
             self.console.print(
@@ -225,6 +377,13 @@ class UsernameScanner:
         done: dict[str, dict[str, Any]] = (
             self.checkpoint.results_for(username) if self.checkpoint else {}
         )
+        if isinstance(self.sites_data, SiteCatalog):
+            done = {
+                name: result for name, result in done.items()
+                if name in self.sites_data
+                and (result.get("ai_analysis") or {}).get("site_definition", {}).get("fingerprint")
+                == self.sites_data.definitions[name].fingerprint
+            }
         pending = {site: tmpl for site, tmpl in self.sites_data.items() if site not in done}
         results.extend(done.values())
         if done:
@@ -233,6 +392,8 @@ class UsernameScanner:
                 f"{len(pending)} remaining.[/dim]"
             )
         if not pending:
+            if self.config.explain:
+                render_explanations(self.console, results)
             return results
 
         conn_limit = max(1, min(self.config.concurrent, len(pending)))
@@ -246,22 +407,34 @@ class UsernameScanner:
 
         start_time = time.monotonic()
         try:
-            async with build_session(self.config, conn_limit) as session:
+            resolver = None
+            if isinstance(self.sites_data, SiteCatalog) and not self.config.proxy:
+                from .netguard import PublicOnlyResolver
+
+                resolver = PublicOnlyResolver()
+            async with build_session(self.config, conn_limit, resolver=resolver) as session:
                 workers = [
                     asyncio.create_task(
                         self._worker(queue, username, session, rate_limiter, results, view)
                     )
                     for _ in range(conn_limit)
                 ]
-                await queue.join()
-                for worker in workers:
-                    worker.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
+                try:
+                    await queue.join()
+                finally:
+                    # Also when the scan itself is cancelled (a caller's timeout):
+                    # otherwise the workers outlive it, blocked on requests and a
+                    # queue that nothing will ever drain.
+                    for worker in workers:
+                        worker.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
         finally:
             view.stop()
 
         total_time = time.monotonic() - start_time
         view.render_results(results)
+        if self.config.explain:
+            render_explanations(self.console, results)
         view.render_summary(results, total_time)
         return results
 
@@ -280,9 +453,27 @@ class UsernameScanner:
             except asyncio.CancelledError:
                 break
             try:
-                result = await self._scan_site(
-                    site, tmpl, username, session, rate_limiter
+                result = await asyncio.wait_for(
+                    self._scan_site(site, tmpl, username, session, rate_limiter),
+                    self._site_deadline(),
                 )
+                results.append(result)
+            except asyncio.TimeoutError:
+                url = self._format_url(site, tmpl, username)
+                self.logger.debug("Gave up on %s after %.0fs", site, self._site_deadline())
+                result = {
+                    "site": site,
+                    "url": url,
+                    "final_url": url,
+                    "status": "Timeout",
+                    "code": 408,
+                    "response_time": 0.0,
+                    "confidence": 0,
+                    "ai_analysis": {
+                        "error": "no answer within the per-site deadline",
+                        "explanation": build_explanation("Timeout", 0, code=408, reason="site_deadline"),
+                    },
+                }
                 results.append(result)
             except Exception as exc:
                 url = self._format_url(site, tmpl, username)
@@ -295,7 +486,10 @@ class UsernameScanner:
                     "code": 0,
                     "response_time": 0.0,
                     "confidence": 0,
-                    "ai_analysis": {"error": str(exc)},
+                    "ai_analysis": {
+                        "error": str(exc),
+                        "explanation": build_explanation("Error", 0, reason="worker_error"),
+                    },
                 }
                 results.append(result)
             if self.checkpoint is not None:
@@ -314,6 +508,65 @@ class UsernameScanner:
             view.advance(found)
             queue.task_done()
 
+    def _site_deadline(self) -> float:
+        """Longest one site's check may take, whatever goes wrong inside it.
+
+        Every attempt has its own timeout and every wait between attempts is
+        capped, so a healthy check ends well inside this. It exists for the
+        cases those bounds miss: a scan is only as fast as its slowest site, and
+        one that never returns holds the whole scan open.
+        """
+        config = self.config
+        budget = (config.retries + 1) * (config.timeout + config.backoff_cap + config.jitter)
+        if config.control_check:
+            budget *= 2     # a Found is followed by one more request to the same site
+        if config.use_playwright and self.browser_fallback is not None:
+            budget += 60.0
+        return budget * 1.5 + 1.0
+
+    async def _same_as_missing_user(
+        self,
+        site_name: str,
+        url_template: str,
+        username: str,
+        fetch,
+        session: aiohttp.ClientSession,
+        rate_limiter: DomainRateLimiter,
+        observation: dict[str, Any] | None = None,
+    ) -> bool:
+        """Whether this page is what the site shows for a user who doesn't exist.
+
+        Sites that answer every profile address with the same page (a JavaScript
+        shell, a soft "not found", a redirect to search) cannot be read for
+        existence from that page. See ``core.control``.
+        """
+        cached = site_name in self._controls
+        if not cached:
+            shape = None
+            # A replayed corpus cannot be asked for a new username; it offers one
+            # it recorded instead.
+            recorded = getattr(self.fetch, "control_for", None)
+            name, url = control_username(), None
+            if recorded is not None:
+                name, url = recorded(site_name) or (name, None)
+            url = url or self._format_url(site_name, url_template, name)
+            try:
+                control = await self.fetch(session, url, self.config, rate_limiter, self.logger)
+                if not control.error:
+                    shape = page_shape(control.content, control.final_url, name)
+            except Exception as exc:  # noqa: BLE001 - no control means no second opinion, not a failed scan
+                self.logger.debug("Control fetch failed for %s: %s", site_name, exc)
+            self._controls[site_name] = shape
+        control_shape = self._controls[site_name]
+        if control_shape is None:
+            if observation is not None:
+                observation.update(outcome="unavailable", cached=cached, source="http")
+            return False
+        same = same_page(page_shape(fetch.content, fetch.final_url, username), control_shape)
+        if observation is not None:
+            observation.update(outcome="same" if same else "different", cached=cached, source="http")
+        return same
+
     async def _scan_site(
         self,
         site_name: str,
@@ -322,6 +575,11 @@ class UsernameScanner:
         session: aiohttp.ClientSession,
         rate_limiter: DomainRateLimiter,
     ) -> dict[str, Any]:
+        definition = getattr(self.sites_data, "definitions", {}).get(site_name)
+        if definition is not None:
+            from .site_rules import scan_defined_site
+
+            return await scan_defined_site(self, definition, username, session, rate_limiter)
         url = self._format_url(site_name, url_template, username)
         fetch = await self.fetch(session, url, self.config, rate_limiter, self.logger)
 
@@ -334,6 +592,14 @@ class UsernameScanner:
 
         ai_analysis: dict[str, Any] = {}
         confidence = 0
+        details = initial = None
+        reason = "fetch_error" if fetch.error else None
+        checks = {
+            "http": {"outcome": "unavailable" if fetch.error else "received", "code": fetch.status, "source": "http"},
+            "bot_wall": {"outcome": "not_run", "source": "http"},
+            "control": {"outcome": "not_run" if self.config.control_check else "disabled"},
+            "browser": {"outcome": "not_run" if self.config.use_playwright else "disabled"},
+        }
         if not fetch.error:
             try:
                 bundle = self.extractor.extract(
@@ -356,7 +622,12 @@ class UsernameScanner:
                     "code": 0,
                     "response_time": round(fetch.response_time, 2),
                     "confidence": 0,
-                    "ai_analysis": {"error": str(exc)},
+                    "ai_analysis": {
+                        "error": str(exc),
+                        "explanation": build_explanation(
+                            "Error", 0, checks=checks, reason="extraction_error",
+                        ),
+                    },
                 }
 
             fingerprint = build_fingerprint(bundle.fingerprint)
@@ -369,6 +640,8 @@ class UsernameScanner:
             )
 
             detection = self.detector.predict(bundle.features)
+            initial = details = detector_evidence(detection)
+            checks["bot_wall"]["outcome"] = "detected" if _looks_like_bot_wall(bundle.signals) else "clear"
             status_text = detection.status
             confidence = detection.confidence
 
@@ -393,12 +666,48 @@ class UsernameScanner:
                     ai_analysis,
                     status_text,
                     confidence,
+                    checks["browser"],
                 )
+                if checks["browser"]["outcome"] == "selected":
+                    details = checks["browser"]["detector"]
+
+            # The mirror image: a block, rate limit or server error page is not
+            # the site's "no such user" page, so it cannot carry "Not Found".
+            if status_text == "Not Found" and http_unavailable(fetch.status):
+                status_text, confidence, reason = "Maybe", min(confidence, 50), "http_unavailable"
+                ai_analysis["method"] = f"{ai_analysis['method']}-http-unavailable"
+
+            # "Found" claims an account exists, and the score alone cannot carry
+            # that: a page is scored on how profile-like it looks, and error
+            # pages, challenge pages and empty JavaScript shells can look the part.
+            if status_text == "Found":
+                async def same_as_missing_user() -> bool:
+                    return await self._same_as_missing_user(
+                        site_name, url_template, username, fetch, session, rate_limiter,
+                        checks["control"],
+                    )
+
+                overruled = await overrule_found(
+                    fetch.status, bundle.signals,
+                    same_as_missing_user if self.config.control_check else None,
+                )
+                if overruled is not None:
+                    status_text, reason = overruled
+                    confidence = 90 if status_text == "Not Found" else min(confidence, 55)
+                    ai_analysis["method"] = f"{ai_analysis['method']}-{reason}"
+                    reason = {
+                        "http-gone": "http_gone", "http-error": "http_error",
+                        "botwall-capped": "bot_wall", "same-as-missing-user": "same_as_control",
+                    }[reason]
 
             if status_text in {"Found", "Not Found"} and confidence >= 85:
                 label = "found" if status_text == "Found" else "not_found"
                 self.fingerprints.add(site_name, label, fingerprint)
 
+        ai_analysis["explanation"] = build_explanation(
+            status_text, confidence, code=fetch.status, detector=details, initial=initial,
+            checks=checks, features=ai_analysis.get("features"), reason=reason,
+        )
         return {
             "site": site_name,
             "url": url,
@@ -419,11 +728,28 @@ class UsernameScanner:
         ai_analysis: dict[str, Any],
         status_text: str,
         confidence: int,
+        observation: dict[str, Any] | None = None,
     ) -> tuple[str, int, dict[str, Any]]:
+        if observation is None:
+            observation = {}
+        observation.update(outcome="attempted", source="rendered")
         try:
             content, final_url = await self.browser_fallback.fetch(url)
         except Exception as exc:
-            self.logger.debug("Playwright fallback failed for %s: %s", site_name, exc)
+            observation["outcome"] = "unavailable"
+            if not self._fallback_warned:
+                self._fallback_warned = True
+                self.logger.warning(
+                    "Browser fallback failed for %s (%s); Maybe results are "
+                    "not re-checked in a browser (further failures are logged "
+                    "at debug)",
+                    site_name,
+                    describe_error(exc),
+                )
+            else:
+                self.logger.debug(
+                    "Playwright fallback failed for %s: %s", site_name, exc
+                )
             return status_text, confidence, ai_analysis
 
         bundle = self.extractor.extract(
@@ -446,7 +772,10 @@ class UsernameScanner:
         )
 
         detection = self.detector.predict(bundle.features)
+        observation["detector"] = detector_evidence(detection, "rendered")
+        observation["outcome"] = "retained_http"
         if detection.confidence > confidence or detection.status != "Maybe":
+            observation["outcome"] = "selected"
             return detection.status, detection.confidence, {
                 "method": f"playwright-{detection.method}",
                 "score": detection.score,

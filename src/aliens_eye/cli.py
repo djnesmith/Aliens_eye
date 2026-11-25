@@ -11,6 +11,7 @@ from typing import Any
 
 from platformdirs import user_config_dir
 from rich.prompt import Confirm, FloatPrompt, IntPrompt, Prompt
+from rich.text import Text
 
 from aliens_eye import __version__
 from aliens_eye.core.analyzer import FeatureExtractor
@@ -27,6 +28,7 @@ from aliens_eye.core.scanner import (
     load_sites_data,
 )
 from aliens_eye.utils.console import get_console, set_plain
+from aliens_eye.utils.fdlimit import raise_fd_limit
 from aliens_eye.utils.logger import setup_logger
 
 TOR_PROXY = "socks5://127.0.0.1:9050"
@@ -62,7 +64,8 @@ def display_banner(site_count: int) -> None:
 [green]by [yellow]arxhr007  [dim]v{__version__}[/dim]"""
     console.print(banner)
     console.print("[yellow]AI-OSINT USERNAME SCANNER[/yellow]")
-    console.print("[red]NOTE: For educational purposes only!\n[/red]")
+    console.print("[red]NOTE: For educational purposes only![/red]")
+    console.print()
 
 
 def build_parser() -> ArgumentParser:
@@ -100,6 +103,12 @@ def build_parser() -> ArgumentParser:
         action="store_true",
         help="Enable Playwright fallback for Maybe results (requires aliens-eye[browser])",
     )
+    parser.add_argument(
+        "--no-control-check",
+        action="store_true",
+        help="Report Found without first checking that the site shows something else "
+             "for a username that doesn't exist (saves one request per Found; more false hits)",
+    )
     parser.add_argument("--proxy", type=str, help="Proxy URL (http://, socks4://, or socks5://)")
     parser.add_argument(
         "--tor", action="store_true", help=f"Route traffic through Tor ({TOR_PROXY})"
@@ -118,7 +127,14 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--no-ml", action="store_true", help="Disable ML detection, heuristics only")
     parser.add_argument("--model", type=str, help="Path to a custom ML model JSON")
     parser.add_argument("--sites", type=str, help="Path to a custom sites JSON")
+    parser.add_argument(
+        "--catalog", choices=["standard", "extended"],
+        help="Site catalog: extended (default, 7,700+ sites) or standard (the smaller original list)",
+    )
+    parser.add_argument("--tag", help="Filter structured sites by tags (comma-separated)")
+    parser.add_argument("--source", help="Filter structured sites by source")
     parser.add_argument("--plain", action="store_true", help="Plain output (no colors/progress)")
+    parser.add_argument("--explain", action="store_true", help="Explain recorded verdict evidence (also with --read)")
     parser.add_argument(
         "--profile",
         choices=["quick", "full", "aggressive"],
@@ -127,9 +143,17 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--watch",
         type=str,
-        help="Re-scan on an interval and alert on changes (e.g. 30m, 6h, 1d)",
+        help="Re-scan on an interval (e.g. 30m, 6h, 1d); first observations establish a baseline, failures are not absence",
     )
     parser.add_argument("--notify", type=str, help="Webhook URL to POST watch-mode changes to")
+    parser.add_argument(
+        "--watch-confirmations", type=int,
+        help="Consecutive absence/profile observations needed before alerting (default: 2; minimum: 1)",
+    )
+    parser.add_argument(
+        "--watch-profile", type=str,
+        help="Opt-in profile change alerts: name,bio,avatar (avatar compares URLs, not image contents)",
+    )
     parser.add_argument(
         "--correlate",
         action="store_true",
@@ -196,6 +220,11 @@ def build_selfcheck_parser() -> ArgumentParser:
         help="With --corpus, score URLs absent from the corpus as fetch errors "
              "instead of failing loudly",
     )
+    parser.add_argument(
+        "--detector-only", action="store_true",
+        help="Score the detector's verdict alone, without the checks a scan applies to "
+             "every Found (HTTP errors, challenge pages, the same page as a missing user)",
+    )
     return parser
 
 
@@ -211,6 +240,7 @@ def build_train_parser() -> ArgumentParser:
     collect.add_argument("--negatives", type=int, default=2, help="Negative samples per site")
     collect.add_argument("--seed", type=int, default=None, help="Random seed")
     collect.add_argument("--sites", type=str, help="Path to a custom sites JSON")
+    collect.add_argument("--corpus", type=str, help="Build grouped training rows from a frozen corpus, without network")
     collect.add_argument(
         "--split", choices=["train", "holdout", "all"], default="train",
         help="Ground-truth split to collect from. Defaults to train; anything "
@@ -225,6 +255,7 @@ def build_train_parser() -> ArgumentParser:
     fit = sub.add_parser("fit", help="Train the model from a labeled dataset CSV")
     fit.add_argument("--data", type=str, required=True, help="Labeled dataset CSV")
     fit.add_argument("--out", type=str, default="model.json", help="Output model JSON path")
+    fit.add_argument("--max-fpr", type=float, default=0.02, help="Maximum false-positive rate on OOF calibration rows")
     fit.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -290,49 +321,6 @@ def build_eval_parser() -> ArgumentParser:
     ablate.add_argument("--json", action="store_true", dest="json_out", help="Print JSON to stdout")
     ablate.add_argument("-v", "--verbose", action="store_true")
 
-    external = sub.add_parser(
-        "external",
-        help="Compare against external tool rule sets (Sherlock / Maigret / WhatsMyName) over the corpus",
-    )
-    external.add_argument("--corpus", type=str, required=True, help="Corpus directory")
-    external.add_argument(
-        "--split", choices=["train", "holdout", "all"], default="all",
-        help="Ground-truth split to score (default: all)",
-    )
-    external.add_argument("--ground-truth", type=str, help="Custom ground-truth JSON")
-    external.add_argument("--model", type=str, help="Path to a custom ML model JSON")
-    external.add_argument(
-        "--sherlock", type=str,
-        help="Path to Sherlock's data.json (MIT; fetch it yourself, it is not vendored)",
-    )
-    external.add_argument(
-        "--maigret", type=str,
-        help="Path to Maigret's data.json (MIT); read with the Sherlock rule semantics",
-    )
-    external.add_argument(
-        "--whatsmyname", type=str,
-        help="Path to wmn-data.json (CC BY-SA 4.0, (C) Micah Hoffman et al.)",
-    )
-    external.add_argument("--out", type=str, help="Write the result bundle as JSON here")
-    external.add_argument("--json", action="store_true", dest="json_out", help="Print JSON to stdout")
-    external.add_argument("-v", "--verbose", action="store_true")
-
-    gt = sub.add_parser(
-        "groundtruth",
-        help="Rebuild the ground-truth splits from external projects' account lists",
-    )
-    gt.add_argument("--sherlock", type=str, help="Sherlock data.json (MIT)")
-    gt.add_argument("--whatsmyname", type=str, help="wmn-data.json (CC BY-SA 4.0)")
-    gt.add_argument("--sites", type=str, help="Path to a custom sites JSON")
-    gt.add_argument(
-        "--holdout-fraction", type=float, default=0.3,
-        help="Share of newly imported sites placed in the holdout split",
-    )
-    gt.add_argument(
-        "--dry-run", action="store_true",
-        help="Report what would change without writing the split files",
-    )
-    gt.add_argument("-v", "--verbose", action="store_true")
     return parser
 
 
@@ -448,6 +436,32 @@ def prompt_scan_level() -> str:
     return {"1": "basic", "2": "intermediate", "3": "advanced"}[choice]
 
 
+def confirm_scan_cost(level: str, username: str, n_sites: int, console) -> bool:
+    """Ask before a level that makes tens of thousands of requests.
+
+    Only Advanced is big enough to need it (123 variations of the username). A
+    level the user typed as a flag is not asked about: they chose it knowingly.
+    """
+    from aliens_eye.core.variations import generate_username_variations, scan_cost
+
+    if level != "advanced":
+        return True
+    cost = scan_cost(len(generate_username_variations(username, level)), n_sites)
+    return Confirm.ask(
+        f"Advanced will make {cost.describe()}. Continue?",
+        default=False,
+        console=console,
+    )
+
+
+def choose_scan_level(username: str, n_sites: int, console) -> str:
+    """Ask for a level, and ask again if the user backs out of an expensive one."""
+    while True:
+        level = prompt_scan_level()
+        if confirm_scan_cost(level, username, n_sites, console):
+            return level
+
+
 def apply_scan_profile(config: ScannerConfig, profile: str, args) -> None:
     presets = {
         "quick": {
@@ -532,10 +546,15 @@ def apply_config(config: ScannerConfig, data: dict) -> dict:
         "fingerprints_path": "fingerprints_path",
         "output_dir": "output_dir",
         "use_playwright": "use_playwright",
+        "control_check": "control_check",
         "max_fingerprints_per_label": "max_fingerprints_per_label",
         "proxy": "proxy",
         "use_ml": "use_ml",
         "exclude_nsfw": "exclude_nsfw",
+        "explain": "explain",
+        "catalog": "catalog",
+        "include_tags": "include_tags",
+        "include_sources": "include_sources",
     }
     path_fields = {"fingerprints_path", "output_dir"}
 
@@ -575,6 +594,8 @@ def apply_cli_overrides(config: ScannerConfig, args) -> None:
         config.output_dir = Path(args.output)
     if args.playwright:
         config.use_playwright = True
+    if getattr(args, "no_control_check", False):
+        config.control_check = False
     if args.tor:
         config.proxy = TOR_PROXY
     elif args.proxy:
@@ -596,10 +617,20 @@ def apply_cli_overrides(config: ScannerConfig, args) -> None:
         config.plain_output = True
     if args.plain:
         config.plain_output = True
+    if getattr(args, "explain", False):
+        config.explain = True
+    if getattr(args, "catalog", None):
+        config.catalog = args.catalog
+    if getattr(args, "tag", None):
+        config.include_tags = parse_site_list(args.tag)
+    if getattr(args, "source", None):
+        config.include_sources = parse_site_list(args.source)
 
 
 def prepare_sites(config: ScannerConfig, logger, sites_dir: str | None = None) -> dict:
-    sites_data = load_sites_data(config.sites_path)
+    from aliens_eye.core.scanner import merge_site_maps
+
+    sites_data = load_sites_data(config.sites_path, catalog=config.catalog)
     if not sites_data:
         logger.error("Could not load sites.json.")
         return {}
@@ -608,12 +639,15 @@ def prepare_sites(config: ScannerConfig, logger, sites_dir: str | None = None) -
     plugins = load_site_plugins(extra_dirs)
     if plugins:
         logger.info("Merged %d plugin site(s) from sites.d directories", len(plugins))
-        sites_data = {**sites_data, **plugins}
+        sites_data = merge_site_maps(sites_data, plugins)
 
     exclude = list(config.exclude_sites or [])
     if config.exclude_nsfw:
         exclude.extend(load_nsfw_sites())
-    sites_data = filter_sites(sites_data, config.include_sites, exclude or None)
+    sites_data = filter_sites(
+        sites_data, config.include_sites, exclude or None,
+        tags=config.include_tags, sources=config.include_sources, exclude_nsfw=config.exclude_nsfw,
+    )
     if not sites_data:
         logger.error("Site filters matched no sites.")
     return sites_data
@@ -667,6 +701,11 @@ def customize_config_interactive(config: ScannerConfig, formats: list[str], args
 
 
 async def run_scan(args) -> None:
+    from aliens_eye.core.watch import validate_watch_options
+
+    if args.json_stdout:
+        set_plain(True, stderr=True)
+    interval, confirmations, profile_fields = validate_watch_options(args)
     logger = setup_logger(args.verbose)
     config_data = load_config(args.config, logger)
     config = ScannerConfig()
@@ -680,7 +719,7 @@ async def run_scan(args) -> None:
 
     exporter_dir = config.output_dir
     if args.read:
-        ResultsExporter(exporter_dir).display_results_from_file(args.read)
+        ResultsExporter(exporter_dir, explain=config.explain).display_results_from_file(args.read)
         return
 
     sites_data = prepare_sites(config, logger, sites_dir=args.sites_dir)
@@ -715,7 +754,8 @@ async def run_scan(args) -> None:
     if scan_level not in {"basic", "intermediate", "advanced"}:
         scan_level = None
     if not scan_level:
-        scan_level = prompt_scan_level() if interactive else "basic"
+        # Chosen from the menu, so it may have been picked without knowing the cost.
+        scan_level = choose_scan_level(usernames[0], len(sites_data), console) if interactive else "basic"
 
     formats_value = args.format if args.format is not None else defaults.get("output_formats")
     formats = parse_formats_value(formats_value)
@@ -734,6 +774,15 @@ async def run_scan(args) -> None:
     browser_fallback = None
     if config.use_playwright:
         browser_fallback = BrowserFallback(config.timeout, DEFAULT_USER_AGENT)
+        # Sites with a catalog rule are judged by that rule and are not rendered
+        # in a browser; saying so beats a flag that silently does nothing.
+        ruled = len(getattr(sites_data, "definitions", {}))
+        if ruled:
+            logger.warning(
+                "Browser re-checks apply to %d of %d sites: the %d with a catalog "
+                "rule are judged by that rule (a custom --sites map is re-checked in full)",
+                len(sites_data) - ruled, len(sites_data), ruled,
+            )
 
     checkpoint = None
     if args.resume:
@@ -741,7 +790,7 @@ async def run_scan(args) -> None:
 
         checkpoint = Checkpoint(args.resume)
 
-    exporter = ResultsExporter(config.output_dir)
+    exporter = ResultsExporter(config.output_dir, only_found=config.only_found, explain=config.explain)
     scanner = UsernameScanner(
         sites_data=sites_data,
         config=config,
@@ -757,11 +806,6 @@ async def run_scan(args) -> None:
         from aliens_eye.core import watch as watch_mod
 
         try:
-            interval = watch_mod.parse_duration(args.watch)
-        except ValueError as exc:
-            logger.error("Invalid --watch interval: %s", exc)
-            return
-        try:
             await watch_mod.run_watch(
                 scanner=scanner,
                 exporter=exporter,
@@ -773,6 +817,9 @@ async def run_scan(args) -> None:
                 console=console,
                 output_dir=config.output_dir,
                 notify_url=args.notify,
+                confirmations=confirmations,
+                profile_fields=profile_fields,
+                json_stdout=config.json_stdout,
             )
         finally:
             fingerprints.save()
@@ -812,6 +859,17 @@ async def run_scan(args) -> None:
                 username, scan_level, all_results, formats,
                 correlation=correlation, domains=domains,
             )
+
+            if config.json_stdout:
+                # One line per username (JSON Lines), so a single username is one JSON
+                # document for json.load or jq. ASCII-escaped, so a console in a
+                # legacy code page cannot choke on it. Everything else goes to stderr.
+                report = exporter.report_dict(username, scan_level, all_results)
+                if correlation is not None:
+                    report["correlation"] = correlation
+                if domains is not None:
+                    report["domains"] = domains
+                print(json.dumps(report, separators=(",", ":")), flush=True)
 
             files_list = ", ".join(str(path) for path in written)
             console.print(f"\n[green]Results saved to:[/green] [blue]{files_list}[/blue]")
@@ -926,7 +984,10 @@ async def run_selfcheck_command(args) -> None:
                     args.split, Path(args.ground_truth) if args.ground_truth else None
                 )
             )
-        jobs = replay.eval_jobs(sites)
+        # A scan asks each site what it shows for a made-up username. The corpus
+        # answers with one recorded negative per site, which then cannot also be
+        # a test row: it would be compared with itself.
+        jobs = replay.eval_jobs(sites, exclude_controls=not args.detector_only)
         if not jobs:
             console.print(
                 f"[red]Corpus at {args.corpus} holds no labelled records for split "
@@ -948,6 +1009,7 @@ async def run_selfcheck_command(args) -> None:
         ground_truth_path=Path(args.ground_truth) if args.ground_truth else None,
         fetch=fetch,
         jobs=jobs,
+        detector_only=args.detector_only,
     )
 
 
@@ -964,6 +1026,12 @@ async def run_train_command(args) -> None:
             )
             return
         sites_data = load_sites_data(Path(args.sites) if args.sites else None)
+        if getattr(args, "corpus", None):
+            from aliens_eye.ml.collect import collect_from_corpus
+
+            count = collect_from_corpus(Path(args.corpus), sites_data, Path(args.out), logger, args.split)
+            console.print(f"[green]Replayed {count} grouped training samples -> {args.out}[/green]")
+            return
         count = await collect_dataset(
             sites_data,
             Path(args.out),
@@ -976,11 +1044,11 @@ async def run_train_command(args) -> None:
     elif args.train_command == "fit":
         from aliens_eye.ml.train import train_model
 
-        model = train_model(Path(args.data), Path(args.out), logger)
-        cv = model["training"].get("cv_accuracy")
+        model = train_model(Path(args.data), Path(args.out), logger, max_fpr=getattr(args, "max_fpr", 0.02))
+        cv = model["training"].get("cv_f1")
         console.print(
             f"[green]Model trained on {model['training']['samples']} samples"
-            + (f" (cv accuracy {cv:.1%})" if cv is not None else "")
+            + (f" (selection CV F1 {cv:.1%}; {model['training'].get('validation')})" if cv is not None else "")
             + f" -> {args.out}[/green]"
         )
 
@@ -1045,13 +1113,6 @@ async def run_eval_command(args) -> None:
     from rich.table import Table
 
     from aliens_eye.eval.ablate import run_ablations
-
-    if args.eval_command == "external":
-        await run_eval_external_command(args)
-        return
-    if args.eval_command == "groundtruth":
-        run_eval_groundtruth_command(args)
-        return
 
     if args.json_out:
         set_plain(True, stderr=True)
@@ -1130,160 +1191,6 @@ async def run_eval_command(args) -> None:
         console.print(f"[dim]Full bundle written to {args.out}[/dim]")
 
 
-def run_eval_groundtruth_command(args) -> None:
-    from importlib import resources
-
-    from aliens_eye.eval import groundtruth as gt
-    from aliens_eye.ml.collect import load_selfcheck_data
-
-    console = get_console()
-    if not (args.sherlock or args.whatsmyname):
-        console.print(
-            "[red]Pass --sherlock and/or --whatsmyname.[/red] Neither project's data is "
-            "vendored here; fetch it upstream and mind the licence "
-            "(Sherlock MIT, WhatsMyName CC BY-SA 4.0)."
-        )
-        return
-
-    catalogue = gt._index_catalogue(load_sites_data(Path(args.sites) if args.sites else None))
-    sherlock = gt.read_sherlock_accounts(Path(args.sherlock), catalogue) if args.sherlock else {}
-    whatsmyname = (
-        gt.read_whatsmyname_accounts(Path(args.whatsmyname), catalogue)
-        if args.whatsmyname else {}
-    )
-
-    existing = load_selfcheck_data("all")
-    entries = gt.cross_source(existing, sherlock, whatsmyname)
-    splits = gt.assign_splits(
-        entries,
-        set(load_selfcheck_data("train")),
-        set(load_selfcheck_data("holdout")),
-        holdout_fraction=args.holdout_fraction,
-    )
-
-    console.print(
-        f"[blue]Catalogue[/blue] {len(catalogue)} hosts  "
-        f"[blue]Sherlock[/blue] {len(sherlock)} sites  "
-        f"[blue]WhatsMyName[/blue] {len(whatsmyname)} sites  "
-        f"[blue]existing[/blue] {len(existing)} -> [green]{len(entries)}[/green]"
-    )
-    if args.dry_run:
-        console.print("[yellow]Dry run: no files written.[/yellow]")
-        return
-
-    data_dir = Path(str(resources.files("aliens_eye.data")))
-    summary = gt.write_splits(
-        entries, splits, data_dir / "selfcheck.json", data_dir / "eval_holdout.json"
-    )
-    console.print(json.dumps(summary, indent=2))
-    console.print(
-        "[dim]Imported accounts are asserted by their source project, not verified. "
-        "Run a capture and the verification pass before treating them as labels.[/dim]"
-    )
-
-
-async def run_eval_external_command(args) -> None:
-    from rich.table import Table
-
-    from aliens_eye.eval.external import compare_external
-
-    if args.json_out:
-        set_plain(True, stderr=True)
-    logger = setup_logger(args.verbose)
-    console = get_console()
-
-    rule_paths = {
-        name: Path(value)
-        for name, value in (
-            ("sherlock", args.sherlock),
-            ("maigret", args.maigret),
-            ("whatsmyname", args.whatsmyname),
-        )
-        if value
-    }
-    if not rule_paths:
-        console.print(
-            "[red]No rule sets given.[/red] Pass at least one of --sherlock / --maigret / "
-            "--whatsmyname. The rule data is not vendored; fetch it from the upstream "
-            "project and mind its licence."
-        )
-        return
-    missing = [str(p) for p in rule_paths.values() if not p.exists()]
-    if missing:
-        console.print(f"[red]Rule file(s) not found:[/red] {', '.join(missing)}")
-        return
-
-    detector = Detector()
-    detector.load_model(logger, Path(args.model) if args.model else None)
-
-    sites = None
-    if args.split != "all":
-        from aliens_eye.ml.collect import load_selfcheck_data
-
-        sites = set(
-            load_selfcheck_data(
-                args.split, Path(args.ground_truth) if args.ground_truth else None
-            )
-        )
-
-    from aliens_eye.ml.collect import load_ground_truth_sources
-
-    provenance = load_ground_truth_sources(
-        args.split, Path(args.ground_truth) if args.ground_truth else None
-    )
-    bundle = await compare_external(
-        Path(args.corpus), detector, logger, rule_paths, sites=sites,
-        provenance=provenance,
-    )
-
-    if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if args.json_out:
-        print(json.dumps(bundle, indent=2, sort_keys=True))
-        return
-
-    console.print(
-        f"[blue]Corpus[/blue] {bundle['corpus']}  "
-        f"[blue]usable rows[/blue] {bundle['usable_rows']}"
-    )
-    for entry in bundle["external"]:
-        m = entry["overall"]
-        console.print(
-            f"\n[bold]{entry['name']}[/bold]  "
-            f"rules {entry['source']['usable_rules']}  "
-            f"covered {entry['samples']} rows ({entry['site_coverage']:.0%})  "
-            f"no rule {entry['rows_without_rule']}  undecided {entry['rows_rule_undecided']}  "
-            f"self-sourced excluded {entry.get('rows_excluded_self_sourced', 0)}"
-        )
-        table = Table(header_style="bold blue")
-        table.add_column("Detector", style="yellow")
-        for col in ("P", "R", "F1", "FPR", "vs this tool", "95% CI"):
-            table.add_column(col, justify="right")
-        table.add_row(
-            entry["name"],
-            f"{m['precision']:.3f}", f"{m['recall']:.3f}", f"{m['f1']:.3f}",
-            f"{m['false_positive_rate']:.3f}", "[dim]reference[/dim]", "",
-        )
-        for our_name, cmp in entry["vs_ours"].items():
-            verdict = "[bold]separable[/bold]" if cmp["separable"] else "[dim]ns[/dim]"
-            table.add_row(
-                f"ours: {our_name}", "", "",
-                f"{cmp['our_f1_on_covered_rows']:.3f}", "",
-                f"{cmp['delta']:+.3f} {verdict}",
-                f"[{cmp['ci_low']:+.3f}, {cmp['ci_high']:+.3f}]",
-            )
-        console.print(table)
-    console.print(
-        "\n[dim]External verdicts come from reimplemented rule semantics applied to the "
-        "same stored responses, not from running the upstream tools. Rows a tool has no "
-        "rule for are excluded from its score rather than counted against it.[/dim]"
-    )
-    if args.out:
-        console.print(f"[dim]Full bundle written to {args.out}[/dim]")
-
-
 def run_diff_command(args) -> None:
     from aliens_eye.core.report import ReportError, diff_reports, load_report
 
@@ -1306,7 +1213,7 @@ def run_diff_command(args) -> None:
 
     from rich.table import Table
 
-    if not (delta["new"] or delta["gone"] or delta["changed"]):
+    if not any(delta.values()):
         console.print("[dim]No differences between the two reports.[/dim]")
         return
 
@@ -1317,7 +1224,7 @@ def run_diff_command(args) -> None:
     for item in delta["new"]:
         table.add_row("[green]+ NEW[/green]", item["key"], item.get("url", ""))
     for item in delta["gone"]:
-        table.add_row("[red]- GONE[/red]", item["key"], item.get("url", ""))
+        table.add_row("[red]- NO LONGER FOUND[/red]", Text(item["key"]), Text(item.get("url", "")))
     for item in delta["changed"]:
         before, after = item["before"], item["after"]
         detail = (
@@ -1325,6 +1232,9 @@ def run_diff_command(args) -> None:
             f"{after['status']} ({after['confidence']}%)"
         )
         table.add_row("[yellow]~ CHANGED[/yellow]", item["key"], detail)
+    for item in delta["profile_changes"]:
+        detail = Text(f"{item['field']}: {item['before']} -> {item['after']} ({item['source']})")
+        table.add_row("[yellow]~ PROFILE[/yellow]", Text(item["key"]), detail)
     console.print(table)
 
 
@@ -1350,10 +1260,14 @@ def main() -> None:
     if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    raise_fd_limit()    # macOS hands out 256; one scan can pass that (#26)
     argv = sys.argv[1:]
-    console = get_console()
     try:
-        if argv and argv[0] == "selfcheck":
+        if argv and argv[0] == "sites":
+            from aliens_eye.catalog import run_catalog_command
+
+            run_catalog_command(argv[1:])
+        elif argv and argv[0] == "selfcheck":
             args = build_selfcheck_parser().parse_args(argv[1:])
             asyncio.run(run_selfcheck_command(args))
         elif argv and argv[0] == "train":
@@ -1381,10 +1295,10 @@ def main() -> None:
             args = build_parser().parse_args(argv)
             asyncio.run(run_scan(args))
     except KeyboardInterrupt:
-        console.print("\n[red]Interrupted by user.[/red]")
+        get_console().print("\n[red]Interrupted by user.[/red]")
         sys.exit(0)
     except Exception as exc:
-        console.print(f"[red]Unexpected error: {exc}[/red]")
+        get_console().print(Text(f"Unexpected error: {exc}", style="red"))
         sys.exit(1)
 
 

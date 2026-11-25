@@ -9,7 +9,7 @@
 <h1 align="center">AI-OSINT Username Scanner</h1>
 
 <h3 align="center">Advanced AI-Powered Social Media Username Finder</h3>
-<h4 align="center">Scan 840+ platforms with ML-blended detection</h4>
+<h4 align="center">Scan 7,700+ platforms with ML-blended detection</h4>
 
 <p align="center">
 <a href="https://pypi.org/project/aliens-eye/"><img alt="PyPI" src="https://img.shields.io/pypi/v/aliens-eye?style=for-the-badge&color=blue"></a>
@@ -22,9 +22,36 @@
 <!-- TODO: record a demo GIF (e.g. with vhs or asciinema) and drop it at docs/demo.gif -->
 <!-- <p align="center"><img src="docs/demo.gif" width="700"></p> -->
 
+---
+
+## 💙 Sponsored by Swiftproxy
+
+<p align="center">
+  <a href="https://www.swiftproxy.net/?ref=Alienseye">
+    <img
+      src="https://raw.githubusercontent.com/arxhr007/Aliens_eye/refs/heads/main/photos/SwiftProxy%20alien%20eyes.png"
+      alt="Sponsored by Swiftproxy"
+      width="100%"
+    />
+  </a>
+</p>
+
+Power your web scraping and data collection with **[Swiftproxy](https://www.swiftproxy.net/?ref=Alienseye)** — a residential proxy provider offering rotating and static residential proxies for reliable, efficient data access.
+
+- **90M+ residential IPs** across 220+ locations
+- **Protocols:** HTTP(S) and SOCKS5
+- **Flexible sessions:** Rotating and sticky
+- **Pricing:** Plans starting at $0.7/GB
+- **Discount:** Get an additional 10% off with code `PROXY90`
+- **Free trials available**
+
+[**Explore Swiftproxy →**](https://www.swiftproxy.net/?ref=Alienseye)
+
+---
+
 ## Highlights
 
-- **840+ platforms** scanned asynchronously in seconds
+- **7,700+ platforms** scanned asynchronously by default (`--catalog standard` for the quicker 780+ original list)
 - **ML + heuristic detection** — a trained model blended with 30 structural signals (HTTP status, DOM shape, keywords, fingerprints) instead of naive status-code checks
 - **Profile extraction** — display name, bio, and avatar pulled from each hit (OpenGraph / JSON-LD / per-site CSS)
 - **Cross-site correlation** — cluster profiles that look like the same person by avatar hash, bio, shared links, and name (`--correlate`)
@@ -36,9 +63,10 @@
 - **MCP server** — expose scanning to LLM agents (`aliens_eye serve`, optional extra)
 - **Proxy & Tor support** — `--proxy socks5://...` or just `--tor`
 - **Site filtering** — `--site github,reddit`, `--exclude-site`, `--no-nsfw`, plus drop-in `sites.d/` plugin site maps
+- **A second opinion on every Found** — the site is also asked for a username that cannot exist; if it shows the same page, the hit is downgraded to Maybe
 - **Calibrated self-check** — `aliens_eye selfcheck` reports precision / recall / F1 / FPR per site
 - **Reproducible evaluation** — record a frozen response corpus once, then replay it for identical metrics run to run (`aliens_eye corpus record` / `selfcheck --corpus`)
-- **Ablations and baselines** — `aliens_eye eval ablate` scores detector configurations with bootstrap confidence intervals; `eval external` compares against Sherlock / Maigret / WhatsMyName rules on the same stored responses
+- **Ablations** — `aliens_eye eval ablate` scores detector configurations with bootstrap confidence intervals
 - **Retrainable + active learning** — retrain with `aliens_eye train`, or hand-label uncertain hits with `aliens_eye label`
 - **Reports** in JSON, CSV, HTML, Markdown, PDF, and graph formats (GEXF, Mermaid, Maltego CSV)
 - **Playwright fallback** for JavaScript-heavy pages (optional extra)
@@ -116,6 +144,12 @@ aliens_eye username --profile quick
 # Plain output for scripts and CI (no colors/progress)
 aliens_eye username --plain
 
+# The report as JSON on stdout, one line per username; the banner, progress and summary go to stderr
+aliens_eye username --json-stdout | jq '.variations[].sites | to_entries[] | select(.value.status == "Found") | .value.url'
+
+# Only Found/Maybe sites in the report (the counts still cover every site scanned)
+aliens_eye username --json-stdout --only-found
+
 # View results from a previous scan
 aliens_eye -r results/username_advanced_20260611_120000.json
 
@@ -151,12 +185,6 @@ aliens_eye selfcheck --split holdout --corpus corpus/v1 --report json
 # Compare detector configurations over that corpus, with confidence intervals
 aliens_eye eval ablate --corpus corpus/v1 --split holdout
 
-# Compare against Sherlock / Maigret / WhatsMyName rules (fetch their data yourself)
-aliens_eye eval external --corpus corpus/v1 --sherlock data.json --whatsmyname wmn-data.json
-
-# Rebuild the ground-truth splits from those projects account lists
-aliens_eye eval groundtruth --sherlock data.json --whatsmyname wmn-data.json
-
 # Interactively label uncertain hits into a training set
 aliens_eye label results/username_basic_20260611_120000.json --out labeled.csv
 
@@ -173,7 +201,7 @@ Custom platforms: drop a `{ "site_name": "https://site/{}" }` JSON file into
 
 ## How detection works
 
-Every response is converted into a 30-dimensional feature vector: HTTP status buckets, username placement (path/title/meta/canonical), error and profile keywords, DOM structure (images, forms, profile/error CSS classes), structured-data signals (og:type, JSON-LD Person), response timing, redirect counts, and per-site fingerprint matches learned from previous scans.
+HTML detection uses a 30-dimensional feature vector: HTTP status buckets, username placement (path/title/meta/canonical), error and profile keywords, DOM structure (images, forms, profile/error CSS classes), structured-data signals (og:type, JSON-LD Person), response timing, redirect counts, and, in the legacy scan path, per-site fingerprint matches learned from previous scans.
 
 Two judges then vote:
 
@@ -182,7 +210,13 @@ Two judges then vote:
 
 The blended probability maps to **Found / Maybe / Not Found** with a confidence percentage. The loaded model supplies both the blend weight and the thresholds — the shipped model uses `0.9 * ml + 0.1 * heuristic`, Found above `0.620`, Not Found below `0.360`. If a model file is missing or invalid, the scanner silently falls back to heuristics with the defaults in `core/detector.py` (`0.4` ML weight, `0.6` / `0.35` thresholds). See [WORKING.md](WORKING.md) for the full table.
 
-> **Treat Found/Maybe as leads to verify, not as findings.** The shipped model was fit on 1,455 samples from 286 platforms and evaluated on 142 platforms it never saw: precision 0.65, recall 0.51, false-positive rate 9% (F1 0.57). It favours fewer false leads over catching every account, and on held-out platforms no configuration -- including this one -- is statistically distinguishable from a plain HTTP-status check on F1.
+A **Found** then has to survive three checks, because a page is scored on how profile-like it looks and error pages, challenge pages and empty JavaScript shells can look the part:
+
+- an HTTP `404`/`410` is reported as Not Found, and any other error code as Maybe at most;
+- a bot-check or error page is capped at Maybe;
+- the site is asked for a random control username, and if it answers with the same page, the result is capped at Maybe (`--no-control-check` skips this; it costs one extra request per Found).
+
+> **Treat Found/Maybe as leads to verify, not as findings or proof of identity.** The shipped model was fit on 1,455 samples and is unchanged by the catalog expansion. Archived benchmark results describe particular captured responses, not current live accuracy. Historical splits used site names, and aliases such as `chess` / `chess.com` cross that boundary; older “unseen platform” claims therefore need qualification. New training collection excludes holdout host groups, and new grouped cross-validation keeps aliases together. Source-provided account labels still require independent review.
 
 ### Retraining the model
 
@@ -203,9 +237,60 @@ aliens_eye selfcheck --split holdout --model model.json --report json
 aliens_eye username --model model.json
 ```
 
-Ground truth is split **site-disjoint** into `data/selfcheck.json` (train, 30
-sites) and `data/eval_holdout.json` (holdout, 13 sites). Scoring `--split train`
-measures fit, not generalization, and will read high.
+The stored ground-truth files contain 286 train and 142 holdout site-name entries,
+not that many independent platforms. New collection protects holdout host groups
+and records `site`, `site_group`, `label_source` and `split` alongside features.
+Scoring `--split train` measures fit, not generalization.
+
+Reuse a locally captured corpus without network access:
+
+```bash
+aliens_eye train collect --corpus corpus --out grouped-dataset.csv
+aliens_eye train fit --data grouped-dataset.csv --out candidate-model.json --max-fpr 0.02
+```
+
+Training fits scalers inside each fold, uses grouped folds when provenance is
+available, and selects blend weights/thresholds from nested out-of-fold
+predictions. `--max-fpr` constrains calibration-set false positives; it is not a
+guarantee for unseen sites. Legacy feature-only CSVs remain readable but are
+explicitly labeled `row-stratified-legacy`, not unseen-site validation. Selection
+CV F1 is not an independent test score. Compare candidate precision **and recall**
+on a separate holdout before replacing the shipped model.
+
+#### Training on the expanded catalog
+
+`scripts/train_expanded.py` gives the model labeled pages from expanded-catalog
+sites. Positives are the usernames the upstream site databases and the curated
+train split assert exist; negatives are generated. Only sites whose profile page is the request qualify: API probes,
+disabled and NSFW (unless `--include-nsfw`) sites are skipped, as is every site
+whose host group overlaps the bundled holdout. Every artifact goes into one
+`--work` directory and no stage overwrites an existing file.
+
+```bash
+# prepare (offline): ground truth + training site list
+python scripts/train_expanded.py prepare --work runs/exp1 \
+    --upstream-data path/to/data.json --max-sites 600
+# record (live network): profile pages + 4 negatives/site into a frozen corpus
+python scripts/train_expanded.py record --work runs/exp1
+# collect, fit, compare (offline): grouped CSV, candidate model, holdout comparison
+python scripts/train_expanded.py collect --work runs/exp1
+python scripts/train_expanded.py fit --work runs/exp1
+python scripts/train_expanded.py compare --work runs/exp1 --holdout-corpus path/to/holdout-corpus
+```
+
+`--upstream-data` must be the same `data.json` snapshot the catalog was built from
+(checked by SHA-256). Upstream usernames are assertions, not verified accounts;
+positives that now return 404 are dropped during collection. `compare` scores
+the shipped and candidate models on the holdout and writes `comparison.json`; the
+shipped model is never replaced automatically. Record the holdout corpus with
+`aliens_eye corpus record --split holdout`.
+
+This trainer remains an HTML model trainer: JSON/API feature-model training
+requires a separately labeled corpus and is not simulated by feeding JSON to the
+HTML classifier. External evaluation expands nested engines and
+matches endpoint templates. Missing API-probe captures or incompatible request
+policies are reported as unsupported/undecided, not borrowed from profile pages
+or fetched live.
 
 ## Using it as a library
 
@@ -227,6 +312,28 @@ async def main():
     print(len(correlation["clusters"]), "clusters")
 
 asyncio.run(main())
+```
+
+For expanded scans, pass the metadata-carrying mapping through unchanged:
+
+```python
+sites = api.load_sites(catalog="extended", tags=["coding"], exclude_nsfw=True)
+report = await api.scan("your_handle", sites=sites)
+```
+
+The mapping still exposes `{site: URL template}`. Converting it with `dict()` or
+serializing only that URL view discards its rule metadata; use the versioned
+catalog file for portable structured definitions. Replacing a URL in the mapping
+removes stale probe rules for that entry.
+
+It can also read a profile link back into a site and username, and fetch a page
+whose address came from somewhere you don't control:
+
+```python
+api.match_profile_url("https://www.instagram.com/_someone_/")
+# [ProfileMatch(site='instagram', username='_someone_')]
+
+page = await api.fetch_page("https://example.com/")   # public http(s) addresses only
 ```
 
 Everything outside `aliens_eye.api` is internal and may change between minor releases.
@@ -266,7 +373,11 @@ The package lives under `src/aliens_eye/`: `core/` (scanner, detector, analyzer,
 
 ## Contributing
 
-Issues and PRs welcome — adding sites to `src/aliens_eye/data/sites.json`, expanding the ground-truth set in `selfcheck.json`, or improving the model all directly improve detection. Run `pytest` and `ruff check src tests` before submitting.
+Issues and PRs welcome — adding sites to `src/aliens_eye/data/sites.json`, expanding the ground-truth set in `selfcheck.json`, or improving the model all directly improve detection. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks, and how detection changes are measured, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community standards.
+
+## Data sources
+
+Site definitions are adapted from community OSINT projects released under the MIT licence, plus public sources. Licence notices ship with the data files. Some test accounts are adapted from WhatsMyName (CC BY-SA 4.0, © Micah Hoffman et al.).
 
 ## Disclaimer
 

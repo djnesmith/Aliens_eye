@@ -172,3 +172,133 @@ def test_package_version_matches_pyproject():
     from aliens_eye import __version__
 
     assert __version__ == _declared_version()
+
+
+def test_selectolax_has_an_upper_bound():
+    """Regression: with an unbounded ``selectolax>=0.3.21`` every fresh install
+    broke the day selectolax 1.0 removed the backend this package imported."""
+    [requirement] = [dep for dep in _declared_dependencies() if dep.startswith("selectolax")]
+    assert "<" in requirement
+
+
+def test_analyzer_uses_a_parser_backend_that_still_exists():
+    """The Modest backend (selectolax.parser) is gone in 1.0; Lexbor is in both."""
+    import aliens_eye.core.analyzer as analyzer
+
+    assert analyzer.HTMLParser.__module__.startswith("selectolax.lexbor")
+
+
+def test_control_check_is_on_by_default_and_can_be_turned_off():
+    from aliens_eye.cli import apply_cli_overrides, build_parser
+    from aliens_eye.core.config import ScannerConfig
+
+    config = ScannerConfig()
+    assert config.control_check is True
+    apply_cli_overrides(config, build_parser().parse_args(["someone"]))
+    assert config.control_check is True
+    apply_cli_overrides(config, build_parser().parse_args(["someone", "--no-control-check"]))
+    assert config.control_check is False
+
+
+# --- warning before an expensive scan level (#26) ---------------------------------------
+
+
+def test_scan_cost_is_requests_and_a_rough_time():
+    from aliens_eye.core.variations import scan_cost
+
+    cost = scan_cost(variations=123, sites=854)
+    assert cost.requests == 105_042
+    assert 90 <= cost.minutes <= 130          # about 16 sites a second at the default concurrency
+    assert scan_cost(variations=1, sites=854).requests == 854
+
+
+def test_cost_wording_is_in_hours_for_long_scans():
+    from aliens_eye.core.variations import scan_cost
+
+    assert "hour" in scan_cost(123, 854).describe()
+    assert "minute" in scan_cost(1, 854).describe()
+    assert "105,042" in scan_cost(123, 854).describe()
+
+
+def test_only_advanced_asks_before_starting(monkeypatch):
+    from aliens_eye import cli
+
+    asked = []
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: asked.append(a[0]) or True)
+    assert cli.confirm_scan_cost("basic", "someone", 854, console=None) is True
+    assert cli.confirm_scan_cost("intermediate", "someone", 854, console=None) is True
+    assert asked == []
+    assert cli.confirm_scan_cost("advanced", "someone", 854, console=None) is True
+    assert len(asked) == 1 and "105" in asked[0]
+
+
+def test_declining_the_warning_is_reported(monkeypatch):
+    from aliens_eye import cli
+
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: False)
+    assert cli.confirm_scan_cost("advanced", "someone", 854, console=None) is False
+
+
+def test_the_prompt_defaults_to_no(monkeypatch):
+    from aliens_eye import cli
+
+    seen = {}
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: seen.update(k) or False)
+    cli.confirm_scan_cost("advanced", "someone", 854, console=None)
+    assert seen["default"] is False
+
+
+def test_the_scan_banner_states_the_cost_for_multi_variation_levels(tmp_path, logger):
+    import asyncio
+    import io
+
+    from rich.console import Console
+    from test_scanner import make_scanner
+
+    buffer = io.StringIO()
+    scanner = make_scanner({"alpha": "http://127.0.0.1:9/{}"}, tmp_path, logger)
+    scanner.console = Console(file=buffer, width=140, force_terminal=False)
+
+    async def run():
+        scanner.scan_all_sites = lambda name: asyncio.sleep(0, result=[])   # no network
+        await scanner.scan_with_variations("someone", "advanced")
+
+    asyncio.run(run())
+    assert "123 username variation" in buffer.getvalue()
+    assert "requests" in buffer.getvalue()
+
+
+def test_declining_an_expensive_level_asks_for_a_level_again(monkeypatch):
+    from aliens_eye import cli
+
+    picks = iter(["advanced", "basic"])
+    monkeypatch.setattr(cli, "prompt_scan_level", lambda: next(picks))
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: False)
+    assert cli.choose_scan_level("someone", 854, console=None) == "basic"
+
+
+def test_accepting_an_expensive_level_keeps_it(monkeypatch):
+    from aliens_eye import cli
+
+    monkeypatch.setattr(cli, "prompt_scan_level", lambda: "advanced")
+    monkeypatch.setattr(cli.Confirm, "ask", lambda *a, **k: True)
+    assert cli.choose_scan_level("someone", 854, console=None) == "advanced"
+
+
+# --- the startup banner carries no promotion ---------------------------------------------
+
+
+def test_the_banner_is_only_the_banner(monkeypatch):
+    import io
+
+    from rich.console import Console
+
+    from aliens_eye import cli
+
+    buffer = io.StringIO()
+    monkeypatch.setattr(cli, "get_console", lambda: Console(file=buffer, width=120, force_terminal=False, legacy_windows=False))
+    cli.display_banner(854)
+    text = buffer.getvalue()
+    assert "AI-OSINT USERNAME SCANNER" in text and "arxhr007" in text
+    assert "New from the author" not in text and "github.com" not in text
+    assert not hasattr(cli, "_promo_panel")

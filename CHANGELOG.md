@@ -1,5 +1,326 @@
 # Changelog
 
+## 2.12.0 (2026-11-19)
+
+### Removed
+- `aliens_eye sites import` (and its `--maigret`, `--sherlock`, `--*-revision`, `--out`,
+  `--with-standard` and `--include-examples` flags).
+- `aliens_eye eval external` and `aliens_eye eval groundtruth`, with the rule-comparison
+  and ground-truth-rebuilding modules behind them.
+
+The bundled catalogs, scanning, `sites stats|list|validate`, `eval ablate` and training are unchanged.
+
+## 2.11.1 (2026-11-19)
+
+### Removed
+- The note about another project under the startup banner, its README section and the
+  `ALIENS_EYE_NO_PROMO` setting.
+
+## 2.11.0 (2026-11-16)
+
+### Fixed
+- **About 1,080 more sites now report a real account as Found instead of Maybe.** Measured
+  on the recorded verification run of the 7,710 enabled sites, known accounts reported
+  Found went from 4,845 to 5,926, and no made-up username was reported Found.
+  - JSON lookups (wiki, federated and similar APIs) are confirmed by the site's own
+    marker or by the `name` field; before, only a few handle fields counted. An answer
+    that names a different handle still stays Maybe.
+  - A site that answers an unknown name with an ordinary page carrying none of its
+    markers (a sign-in or search page) no longer cancels a Found that rests on an
+    explicit marker; the two pages are compared by what they show. A challenge or error
+    page as the control still verifies nothing.
+  - A rule whose markers no longer match the site's markup defers to the page itself,
+    at reduced confidence, and only when the site refuses the control username.
+- Explanations no longer list the same reason code twice.
+
+### Changed
+- `sites stats`, `sites list` and `sites validate` read the same catalog a scan does
+  (the full one) unless `--catalog standard` is given.
+- `--playwright` now says how many sites it applies to: sites with a catalog rule are
+  judged by that rule and are not re-checked in a browser.
+
+## 2.10.1 (2026-11-10)
+
+### Changed
+- The note under the startup banner points to a different project.
+
+## 2.10.0 (2026-11-07)
+
+### Changed
+- **Scans use the full 7,700+ site catalog by default.** `aliens_eye <username>`, the
+  library's `scan()`/`load_sites()`, the MCP server, the TUI and `--expand` now read the
+  extended catalog; `--catalog standard` (or `"catalog": "standard"` in `config.json`)
+  scans the original 788-site list. `profile_url()` and `match_profile_url()` still answer
+  with standard-catalog names first, so existing site names keep their URLs. Evaluation
+  and training keep reading the standard catalog, which the ground-truth splits are
+  keyed to.
+
+## 2.9.1 (2026-11-07)
+
+### Fixed
+- **A rate-limit or block page no longer reports an account as missing.** A site answering
+  401, 403, 407, 408, 419, 420, 425, 429, 451, 499, 999 or 5xx serves an error page, not its
+  "no such user" page, yet the detector could still score it Not Found: Hacker News answered
+  HTTP 419 for every username and a real account was reported missing. Those responses are
+  now Maybe (`http_unavailable`) in scans, site-rule checks and the self-check; 404/410 still
+  mean Not Found. Such pages are also no longer stored as "not found" fingerprints.
+
+## 2.9.0 (2026-11-07)
+
+### Changed
+- **Every catalog site was checked live**, with a known account and a made-up one. 945 sites
+  were found broken and are no longer scanned: 68 reported a made-up username as existing
+  (false positives), and 877 failed twice, once on a second pass with longer timeouts
+  (605 unreachable, 272 no longer finding a known account). They are disabled in
+  `--catalog extended`, now **7,710 enabled sites**, and removed from the default catalog,
+  now **788 sites**. 56 broken default sites stay because the ground-truth splits use them.
+- The detection model is unchanged. Candidates trained on the newly captured pages either
+  raised false positives (7 to 20 on today's holdout pages) or lost recall (0.48 to 0.37),
+  so none beat the shipped model on the holdout.
+
+### Added
+- **A second pinned community site database** (469 valid entries, MIT) is merged into
+  `--catalog extended`. Same-URL entries merge with the other name kept as an alias, and an
+  active rule replaces an entry its source marks disabled. `sites import --include-examples`
+  keeps upstream usernames as unverified training examples.
+- **`scripts/train_expanded.py`** trains a candidate model on expanded-catalog sites:
+  `prepare` (offline ground truth from upstream and curated usernames), `record` (live
+  corpus capture), `collect`, `fit` and `compare` (offline, against the holdout). API-probe,
+  disabled, NSFW and holdout-overlapping sites are excluded, and the shipped model is never
+  replaced automatically.
+- **`scripts/verify_catalog.py`** checks every enabled catalog site live with one known and
+  one made-up username, then judges the frozen responses offline with the scanner's own
+  per-site check, writing a verdict per site to `sites.csv`. Interrupted captures resume, and
+  `apply` disables the broken sites (false positives at once, failures only after a recheck).
+- `train collect --corpus` accepts a custom ground-truth file from library callers, and
+  custom ground truth now also excludes holdout host groups.
+
+## 2.8.0 (2026-11-07)
+
+### Added
+- **`--explain`** shows the evidence behind each verdict: the HTTP response, each detector's
+  verdict and threshold, the control check and any browser fallback. HTML and Markdown reports
+  carry the same evidence, and JSON, library API and MCP results gain a structured
+  `explanation` object.
+- **`--catalog extended`** scans an expanded community catalog (9,268 entries, 8,587 enabled)
+  built from MIT-licensed sources with recorded provenance, guarded probes and explicit control
+  evidence. The default catalog and model are unchanged. `aliens_eye sites import|stats|list|validate`
+  inspect and convert local site databases offline.
+- **`--watch-profile name,bio,avatar`** adds opt-in alerts when extracted profile fields change,
+  comparing only fields with matching provenance.
+- CONTRIBUTING.md and CODE_OF_CONDUCT.md.
+
+### Fixed
+- Watch mode no longer reports a profile as gone after a timeout, block, error or filter. Absence
+  now needs consecutive HTTP 404/410 responses (`--watch-confirmations`, default 2), the count
+  survives restarts through scoped state files, and control checks refresh every cycle.
+- Diff reports label removals "no longer found" and show profile field changes; malformed nested
+  reports are rejected cleanly.
+- `--watch` with `--resume` is rejected, `--watch --json-stdout` emits one report line per
+  username per cycle, and webhooks check the response status and refuse redirects.
+- ML validation keeps site aliases and preprocessing from leaking between training and
+  validation folds.
+
+## 2.7.5 (2026-10-25)
+
+### Changed
+- The note about [lxask](https://github.com/arxhr007/lxask) under the startup banner is now a
+  bright gold box with a star, and the link has its own line so a narrow terminal never splits
+  it. A console that cannot show emoji (an ASCII-only pipe, an old Windows console) gets an
+  asterisk instead of the star. `ALIENS_EYE_NO_PROMO=1` still hides it, and it is still never
+  printed with `--json-stdout`, by the library API or by the MCP server.
+
+## 2.7.4 (2026-10-20)
+
+### Fixed
+- **A scan could run the process out of file descriptors** (#26, the follow-up log:
+  `Task exception was never retrieved ... OSError: [Errno 24] Too many open files`).
+  Three things added up:
+  - aiohttp holds each finished request's socket in a pool for 75 seconds (its default),
+    one per site, while the connector's `limit` counts only the connections in use.
+    Scanning 854 sites therefore left several hundred idle sockets open at once -- past
+    macOS's default of 256 file descriptors, after which every socket, and every attempt
+    to spawn the Playwright driver, failed with Errno 24. Idle sockets are now reaped
+    after 10 seconds, and the CLI raises the soft limit to 4096 at startup where the OS
+    allows it.
+  - Errno 24 in a fetch read only "Too many open files", like the site had failed. It now
+    says the process hit its file-descriptor limit and names `ulimit -n`.
+  - A browser fallback that could not start was logged at debug level, so the scan looked
+    healthy while none of its "Maybe" results were re-checked in a browser. The first
+    failure is now warned about once per scan.
+- **A start of Playwright interrupted by the scan's per-site deadline left its driver
+  process and pipes running**, held by nothing: leaked file descriptors, and the
+  fire-and-forgotten `Connection.run()` task that printed "Task exception was never
+  retrieved". A start that fails or is cancelled now stops the driver it already spawned.
+
+## 2.7.3 (2026-10-20)
+
+### Fixed
+- **`--json-stdout` printed nothing.** It silenced the banner but a scan never wrote its
+  JSON, so `aliens_eye username --json-stdout | jq` got an empty stream. It now writes the
+  report to stdout as one JSON line per username (JSON Lines), so a single username is one
+  document that `json.load` or `jq` reads directly. The banner, progress bar and summary go
+  to stderr, and the output is ASCII-escaped so a console in a legacy code page cannot choke
+  on a name with accents. Files are still written to the output folder as before.
+- **`--only-found` did nothing.** The flag was read and then ignored. Reports now list just
+  the Found and Maybe sites; the counts in them (`sites_scanned`, `not_found`, ...) still
+  cover every site scanned, and the report is marked `"only_found": true`. It applies to the
+  JSON on stdout and to the saved files, including CSV.
+
+### Added
+- A README section and one line under the startup banner about the author's other project,
+  [lxask](https://github.com/arxhr007/lxask). `ALIENS_EYE_NO_PROMO=1` hides the line. It is
+  never printed with `--json-stdout`, by the library API or by the MCP server.
+
+## 2.7.2 (2026-10-19)
+
+### Fixed
+- **The browser fallback could start dozens of Chromium processes and keep pages open
+  forever** (#26, a Mac that ran out of memory with the fallback switched on). The fallback
+  (`--playwright`, or "fallback" in the interactive settings) re-checks every "Maybe" result
+  in a real browser. Two bugs in it:
+  - The browser was started on first use, and the check for "already started" ran before the
+    lock that guards it. With 50 scan workers asking at once, each one launched its own
+    Chromium, and only the last was ever closed.
+  - A page that timed out, failed to load, or was cancelled by the scan's deadline was never
+    closed, so a scan accumulated hundreds of open pages.
+
+  The browser now starts once, every page is closed whatever happens, the browser context is
+  replaced every 40 pages so its memory is returned, and a browser that fails halfway through
+  starting is shut down. Checked against a real Chromium: 20 simultaneous fetches, half to a
+  page that never finishes loading, now use one browser (4 processes), 341 MB at most, and
+  leave no page open and no process running after the scan. The old code, given only 8
+  simultaneous fetches, passed 1.5 GB in seconds.
+
+  Scans without the fallback were never affected.
+
+## 2.7.1 (2026-10-19)
+
+### Added
+- **The Advanced level now says what it will do before it starts.** It checks 123
+  variations of the username, which on all sites is about 105,000 requests and close to two
+  hours. Picking it from the menu now asks for confirmation first (the default is No, and
+  declining returns to the menu). A level given as `-l advanced` is not asked about. Every
+  level with more than one variation also prints its request count and a rough time under
+  the scan banner. The time assumes about 16 sites a second, measured on a default scan.
+  Prompted by a report of a very long scan on a small laptop (#26).
+
+  Memory, for the record, measured on 2.7.0: a default scan peaks at about 350 MB, and 12
+  variations of all 854 sites at about 415 MB.
+
+## 2.7.0 (2026-10-08)
+
+### Fixed
+- **Usernames that don't exist were reported as Found** (#22, reported with rendered-page
+  evidence by @vollegrewar). A made-up username came back Found on 11 of 19 sites tried,
+  up to 95% confidence. The detector scores how profile-like a page looks, and three kinds
+  of page look the part without being one. A Found now has to survive a check for each:
+  - **The site's own answer.** HTTP `404` or `410` is reported as Not Found whatever the
+    score (chatujme.cz answered 404 and was Found at 84%). Any other error code, such as a
+    `403` block page or a `500`, is Maybe at most.
+  - **The same page for everyone.** JavaScript apps, soft "no such user" pages and
+    redirects to search answer every profile address alike. For each Found, the site is now
+    also asked for a username that cannot exist; when both answers are the same page, the
+    result is Maybe. One extra request per Found, cached per site, so a full scan takes the
+    same time (54 seconds before and after for 858 sites).
+  - Bot-check pages, as since 2.5.1.
+
+  Measured on recorded pages from 135 sites the model never trained on, same rows before
+  and after:
+
+  | | 2.6.0 | 2.7.0 | change (95% interval) |
+  |---|---|---|---|
+  | Missing usernames reported Found | 33 of 399 (8.3%) | 4 of 399 (1.0%) | -7.3 points (-11.7 to -3.5) |
+  | Real accounts reported Found | 93 of 172 (54%) | 85 of 172 (49%) | -4.7 points (-8.8 to -1.2) |
+  | Precision | 0.74 | 0.96 | |
+
+  The accounts no longer reported Found are ones whose page is identical to a missing
+  user's: nothing in the response told them apart, so they are a Maybe. Of the 4 false
+  hits left, 2 are real accounts: test names meant not to exist that do, on chess.com and
+  Discogs. The other 2 are one site whose pages differ slightly on every load.
+  The threshold was chosen on the 286 training sites, where the same change takes false
+  hits from 7.3% to 0.9%.
+
+  Live, a scan of all sites for a username used on one of them went from 54 Found to 3.
+
+### Added
+- `--no-control-check` (and `control_check` in a config file) skips the second request.
+- `aliens_eye selfcheck` now scores what a scan reports, with the checks above;
+  `--detector-only` scores the detector's verdict alone, as before.
+
+### Removed
+- Four sites whose address can never identify an account by username: `pubmed` (a search
+  page), `pornmd` (a search aggregator), `literotica` and `empornium` (the address takes a
+  numeric id). 854 sites remain.
+
+### Not changed
+- The other suggestions in #22: rendering every page in a browser, and searching sites
+  that have no profile address. `wikipedia` and `giphy` keep their addresses: with the
+  check above, a username that doesn't exist is no longer Found on either.
+
+## 2.6.0 (2026-10-08)
+
+### Fixed
+- **One site could stall a whole scan.** A site answering `429` or `503` with a long
+  `Retry-After` was obeyed in full, so `Retry-After: 3600` held the scan at that request
+  for an hour (and the wait was applied twice). The header is the server's to set, so it is
+  now honoured only up to the retry backoff cap (8 seconds); a site asking for longer is
+  reported as an error and not asked again.
+- Every site's check now has an overall deadline (about 80 seconds with default settings),
+  after which it is reported as `Timeout`. A scan is only as fast as its slowest site, and
+  a check that never returned kept the whole scan open.
+- **YouTube channels were mostly reported as not found.** The check asked for
+  `youtube.com/<name>`, an address only older channels have. It now asks for
+  `youtube.com/@<name>`, the handle every channel has. Of six real channels that came back
+  "Not Found", five are now found; the sixth no longer exists.
+- Cancelling a scan from code that uses the API (for example with a timeout) left its
+  worker tasks running.
+
+### Security
+- **The address check on scraped URLs could be bypassed with a redirect.** Since 2.4.0,
+  avatar URLs taken from scanned pages were only fetched if they pointed at a public
+  address. The check covered the URL itself, and the HTTP client then followed redirects
+  unchecked, so a public URL answering `302 Location: http://127.0.0.1/...` was still
+  followed. This affected `--correlate` and `--format pdf`. Redirects are now followed one
+  hop at a time with every hop validated, and `--correlate` pins the connection to the
+  address that was checked, which also closes a DNS-rebinding race.
+
+### Added
+- `aliens_eye.api.match_profile_url(url)`: which site and username a profile link belongs
+  to, for any site in the catalogue. `https://www.instagram.com/_someone_/` gives
+  `("instagram", "_someone_")`; a repository, a navigation page or an unknown host gives
+  nothing.
+- `aliens_eye.api.fetch_page(url)`: fetch one page whose address came from somewhere you do
+  not control, with the checks above.
+- `aliens_eye.api.profile_url(site, username)`.
+
+### Changed
+- `--recurse-depth` now understands profile links for every site in the catalogue. It used
+  to recognise 19 hard-coded domains and take the first path segment, which missed
+  `linkedin.com/in/<user>` and `<user>.tumblr.com` and misread `github.com/<user>/<repo>`.
+
+## 2.5.1 (2026-10-07)
+
+### Fixed
+- **Fresh installs crashed on start.** selectolax 1.0.0 (released 2026-10-03) removed the
+  HTML parser backend Aliens Eye imported, and the dependency had no upper bound, so every
+  new `pip install aliens-eye` since then failed with `ImportError: Modest backend is
+  deprecated since selectolax 1.0`. The analyzer now uses selectolax's Lexbor backend, which
+  works on both old and new versions, and the dependency is capped at `<2`. Checked on 706
+  recorded pages: no detection result changes. Thanks to @cristianchiriac (#23).
+
+  If you hit this, upgrade: `pip install -U aliens-eye`.
+- **Bot-check and error pages reported as Found.** Pages such as Cloudflare's "Checking your
+  browser" return HTTP 200 and mention users or profiles, so they could be scored as a found
+  account. A result whose title or meta tags mark it as a challenge, verification or error
+  page is now capped at Maybe. Thanks to @BBmmo-code (#19).
+
+### Added
+- 18 Chinese platforms whose profile URL carries the username, including CSDN, SegmentFault,
+  cnblogs, V2EX, LOFTER and Jianshu. Thanks to @BBmmo-code (#19). Two more from that
+  contribution, leetcode.cn and hupu, were left out because they answer "found" for
+  usernames that do not exist.
+
 ## 2.5.0 (2026-09-18)
 
 ### Security

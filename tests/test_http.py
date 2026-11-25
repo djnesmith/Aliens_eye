@@ -1,6 +1,7 @@
 """Body reading: the whole page, not whatever happened to arrive first."""
 
 import asyncio
+import errno
 
 import aiohttp
 import pytest
@@ -8,7 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from aliens_eye.core.config import ScannerConfig
-from aliens_eye.core.http import fetch_url
+from aliens_eye.core.http import describe_error, fetch_url
 from aliens_eye.core.rate_limit import DomainRateLimiter
 
 HEAD = "<html><head><title>t</title>" + "<!-- padding -->" * 3000  # ~48 KB of head
@@ -73,3 +74,81 @@ async def test_fetch_still_honours_the_size_cap(dribble_server, logger):
             config, DomainRateLimiter(), logger,
         )
     assert len(result.content.encode()) == 10_000
+
+
+# --- Retry-After: the server does not get to decide how long a scan sleeps ----------------
+#
+# Found in a real scan that sat at 1715 of 2574 checks for over ten minutes: one
+# site answered 429 with a long Retry-After, and the scanner slept for all of it.
+
+
+@pytest.fixture
+async def busy_server():
+    app = web.Application()
+    hits = []
+
+    async def busy(request):
+        hits.append(asyncio.get_running_loop().time())
+        return web.Response(status=429, text="slow down",
+                            headers={"Retry-After": request.query["wait"]})
+
+    app.router.add_get("/busy", busy)
+    server = TestServer(app)
+    await server.start_server()
+    server.hits = hits
+    yield server
+    await server.close()
+
+
+async def fetch_busy(server, logger, wait, **config):
+    cfg = ScannerConfig(rate_limit_delay=0.0, jitter=0.0, **config)
+    url = f"http://{server.host}:{server.port}/busy?wait={wait}"
+    async with aiohttp.ClientSession() as session:
+        return await asyncio.wait_for(fetch_url(session, url, cfg, DomainRateLimiter(), logger), 5)
+
+
+@pytest.mark.parametrize("wait", ["3600", "86400", "inf", "1e308"])
+async def test_a_long_retry_after_does_not_stall_the_scan(busy_server, logger, wait):
+    result = await fetch_busy(busy_server, logger, wait, retries=2, backoff_base=0.0)
+    assert result.status == 429 and result.error
+    # Asking again sooner than the site said would only be refused again.
+    assert len(busy_server.hits) == 1
+
+
+@pytest.mark.parametrize("wait", ["-5", "nan", "soon", "Wed, 21 Oct 2026 07:28:00 GMT"])
+async def test_a_meaningless_retry_after_is_ignored(busy_server, logger, wait):
+    result = await fetch_busy(busy_server, logger, wait, retries=1, backoff_base=0.0)
+    assert result.status == 429
+    assert len(busy_server.hits) == 2      # retried on the normal backoff
+
+
+async def test_a_short_retry_after_is_honoured_once_not_twice(busy_server, logger):
+    await fetch_busy(busy_server, logger, "0.4", retries=1, backoff_base=0.0)
+    first, second = busy_server.hits
+    assert 0.35 <= second - first < 0.7
+
+
+# --- Errno 24: the process ran out of file descriptors, the site did not fail ----------
+
+
+class ExhaustedSession:
+    """A session whose very first socket fails the way a full process does."""
+
+    def get(self, *args, **kwargs):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+
+async def test_running_out_of_file_descriptors_names_the_fix(logger):
+    """A scan of 854 sites passed macOS's 256 descriptors; the error that
+    followed said only "Too many open files", like the site had failed (#26)."""
+    config = ScannerConfig(retries=0, rate_limit_delay=0.0)
+    result = await fetch_url(
+        ExhaustedSession(), "https://example.test/a", config, DomainRateLimiter(), logger
+    )
+    assert result.error and "file-descriptor" in result.error
+    assert "ulimit" in result.error
+
+
+def test_a_ordinary_error_is_reported_verbatim():
+    assert describe_error(aiohttp.ClientError("boom")) == "boom"
+    assert describe_error(ConnectionResetError("peer reset")) == "peer reset"

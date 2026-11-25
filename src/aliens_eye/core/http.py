@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import random
 import time
 from dataclasses import dataclass
@@ -8,6 +9,14 @@ import aiohttp
 
 from .config import ScannerConfig
 from .rate_limit import DomainRateLimiter
+
+# How long a finished request's socket may sit idle in the pool. aiohttp's
+# default is 75s, and the pool holds one idle connection per site for that
+# long: a scan of 854 sites then had hundreds open at once, past macOS's
+# default of 256 file descriptors, and every socket and subprocess spawn after
+# that failed with Errno 24 (#26). The ``limit`` of the connector does not
+# bound these -- it counts only the connections currently in use.
+KEEPALIVE_SECONDS = 10.0
 
 
 @dataclass
@@ -49,13 +58,36 @@ def _should_retry(status: int) -> bool:
 
 
 def _parse_retry_after(headers: dict[str, str]) -> float | None:
+    """Seconds the server asked us to wait, when it gave a usable number.
+
+    The date form is treated as absent, as are zero, negative and NaN values.
+    Infinity is kept: it is a (very) long wait, which the caller refuses.
+    """
     value = headers.get("Retry-After")
     if not value:
         return None
     try:
-        return float(value)
+        seconds = float(value)
     except ValueError:
         return None
+    if seconds != seconds or seconds <= 0:
+        return None
+    return seconds
+
+
+def describe_error(exc: BaseException) -> str:
+    """A fetch failure as text, naming the fix when there is an obvious one.
+
+    Errno 24 means the process-wide file-descriptor limit was hit. It reaches
+    us from aiohttp's socket and from the browser fallback's driver spawn alike,
+    and as "Too many open files" alone it reads like the site failed (#26).
+    """
+    if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
+        return (
+            f"{exc.strerror or exc} (the process hit its file-descriptor limit; "
+            "macOS starts programs at 256 -- raise it with e.g. `ulimit -n 4096`)"
+        )
+    return str(exc)
 
 
 async def fetch_url(
@@ -86,6 +118,35 @@ async def fetch_url(
                 http_proxy = config.proxy
 
             start_time = time.monotonic()
+            if config.request is not None:
+                from .netguard import guarded_get
+
+                request = config.request
+                response = await guarded_get(
+                    session, url, timeout=config.timeout, max_bytes=config.max_content_bytes,
+                    proxy=http_proxy, headers=request.headers, follow_redirects=request.follow_redirects,
+                )
+                encoding = request.encoding or response.charset or "utf-8"
+                try:
+                    content = response.body.decode(encoding, errors="replace")
+                except LookupError:
+                    content = response.body.decode("utf-8", errors="replace")
+                last_status, last_headers = response.status, response.headers
+                final_url, redirect_count = response.final_url, response.redirects
+                if _should_retry(last_status) and attempt < config.retries:
+                    retry_after = _parse_retry_after(last_headers)
+                    error_message = f"HTTP {last_status}"
+                else:
+                    return FetchResult(
+                        url, final_url, last_status, content, time.monotonic() - start_time,
+                        last_headers, None, redirect_count,
+                    )
+                if retry_after and retry_after > config.backoff_cap:
+                    break
+                backoff = min(config.backoff_base * (2 ** attempt), config.backoff_cap)
+                await asyncio.sleep(max(backoff + random.uniform(0.0, config.jitter), retry_after or 0.0))
+                retry_after = None
+                continue
             async with session.get(
                 url, timeout=config.timeout, allow_redirects=True, proxy=http_proxy
             ) as response:
@@ -125,9 +186,20 @@ async def fetch_url(
             last_status = exc.status or last_status
             retry_after = _parse_retry_after(last_headers)
         except aiohttp.ClientError as exc:
-            error_message = str(exc)
+            # ClientOSError is one of these: a refused or exhausted socket
+            # arrives here, errno included.
+            error_message = describe_error(exc)
+        except OSError as exc:
+            error_message = describe_error(exc)
         except Exception as exc:
             error_message = str(exc)
+
+        if retry_after and retry_after > config.backoff_cap:
+            # The header is the server's to set, so obeying it lets one site stall
+            # a whole scan: "Retry-After: 3600" held a scan of 858 sites at its
+            # last request for an hour. Asking again sooner than the site said
+            # would only be refused again, so this site is done.
+            break
 
         if attempt < config.retries:
             backoff = min(config.backoff_base * (2 ** attempt), config.backoff_cap)
@@ -135,6 +207,9 @@ async def fetch_url(
             if retry_after:
                 backoff = max(backoff, retry_after)
             await asyncio.sleep(backoff)
+            # That sleep was the wait the site asked for. Left set, the rate
+            # limiter would sleep for it a second time before the next attempt.
+            retry_after = None
 
     logger.debug("Fetch failed for %s: %s", url, error_message)
     return FetchResult(
